@@ -7,6 +7,9 @@ from square.environment import SquareEnvironment as square_env
 import threading
 import time
 import os
+import http.server
+import json
+import socketserver
 
 
 # Configure your Square client (set your access token and location ID)
@@ -21,75 +24,120 @@ square_client = Square(
 shared_device_id = ""  # <-- Add this shared variable
 
 
+# --- Webhook/Callback Server ---
+class PaymentCallbackHandler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        content_length = int(self.headers['Content-Length'])
+        post_data = self.rfile.read(content_length)
+        data = json.loads(post_data)
+        # You may want to add authentication/validation here
+        if data.get("type") == "payment.updated":
+            payment = data.get("data", {}).get("object", {}).get("payment", {})
+            status = payment.get("status")
+            idempotency_key = payment.get("reference_id")
+            if status == "COMPLETED":
+                State.on_payment_success(idempotency_key)
+        self.send_response(200)
+        self.end_headers()
+
+
+# Start the callback server in a background thread
+PORT = 8081
+
+
+def start_callback_server():
+    with socketserver.TCPServer(("", PORT), PaymentCallbackHandler) as httpd:
+        print(f"Callback server running on port {PORT}")
+        httpd.serve_forever()
+
+
+threading.Thread(target=start_callback_server, daemon=True).start()
+
+
+# --- State ---
 class State(rx.State):
-    """The app state."""
-
     amount: int = 0
-    custom_amount: str = ""
+    value_entry: str = ""
+    auto_retry: bool = False
     transaction_success: bool = False
+    current_idempotency_key: str = ""
+    payment_timer: threading.Timer = None
 
-    def set_amount(self, amount: int):
-        self.amount = amount
-        self.trigger_transaction()
+    def set_value_entry(self, value: str):
+        self.value_entry = value
 
-    def set_custom_amount(self, value: str):
-        self.custom_amount = value
+    def set_auto_retry(self, value: bool):
+        self.auto_retry = value
 
-    def submit_custom_amount(self):
+    def submit_value(self):
         try:
-            amt = int(float(self.custom_amount) * 100)
+            amt = int(float(self.value_entry) * 100)
             self.amount = amt
             self.trigger_transaction()
         except Exception:
-            pass  # Add error handling as needed
-
-    def reset_page(self):
-        self.amount = 0
-        self.custom_amount = ""
-        self.transaction_success = False
+            pass
 
     def trigger_transaction(self):
         global shared_device_id
         if not shared_device_id:
             print("Device ID is not set. Please pair the terminal first.")
             return
-        # Use Square Terminal API to create a checkout request
-        try:
-            idempotency_key = f"trans-{int(time.time())}"  # import at function scope to avoid circular import
-            body = {
-                "idempotency_key": idempotency_key,
-                "checkout": {
-                    "amount_money": {
-                        "amount": self.amount,
-                        "currency": "USD",
-                    },
-                    "device_options": {
-                        "device_id": shared_device_id,  # Use the shared device_id
-                    },
-                    "note": "Tip from Reflex POS",
-                    "reference_id": "reflex-pos-transaction",
-                }
+        idempotency_key = f"trans-{int(time.time())}"
+        self.current_idempotency_key = idempotency_key
+        body = {
+            "idempotency_key": idempotency_key,
+            "checkout": {
+                "amount_money": {
+                    "amount": self.amount,
+                    "currency": "USD",
+                },
+                "device_options": {
+                    "device_id": shared_device_id,
+                },
+                "note": "POS Payment",
+                "reference_id": idempotency_key,
             }
-            result = square_client.terminal.checkouts.create(**body)
-            if hasattr(result, "checkout") and result.checkout:
-                print("Checkout created:", result.checkout)
-                self.transaction_success = True
-                threading.Thread(target=self._delayed_reset, daemon=True).start()
-            else:
-                print("Terminal checkout failed:", getattr(result, "errors", "Unknown error"))
-        except Exception as e:
-            print("Error processing terminal checkout:", e)
+        }
+        result = square_client.terminal.checkouts.create(**body)
+        if hasattr(result, "checkout") and result.checkout:
+            print("Checkout created:", result.checkout)
+            self.transaction_success = False
+            # Start a timer for 2 minutes to check for payment completion
+            if self.payment_timer:
+                self.payment_timer.cancel()
+            self.payment_timer = threading.Timer(120, self.retry_transaction)
+            self.payment_timer.start()
+        else:
+            print(
+                "Terminal checkout failed:",
+                getattr(result, "errors", "Unknown error")
+            )
 
-    def _delayed_reset(self):
-        time.sleep(10)
-        self.reset_page()
+    def retry_transaction(self):
+        if not self.transaction_success and self.auto_retry:
+            print(
+                "No payment confirmation after 2 minutes. "
+                "Cancelling and retrying..."
+            )
+            # Cancel the previous transaction if possible
+            self.trigger_transaction()
+
+    @classmethod
+    def on_payment_success(cls, idempotency_key):
+        # Called by the webhook handler
+        if cls.current_idempotency_key == idempotency_key:
+            cls.transaction_success = True
+            print(f"Payment {idempotency_key} completed!")
+            if cls.payment_timer:
+                cls.payment_timer.cancel()
 
 
+# --- Terminal Pairing State ---
 class TerminalPairState(rx.State):
     password: str = ""
     entered_password: str = ""
     pairing_code: str = ""
-    device_id: str = ""  # <-- Store the device_id here
+    device_id: str = ""
     error: str = ""
     is_authenticated: bool = False
     is_pairing: bool = False
@@ -101,7 +149,9 @@ class TerminalPairState(rx.State):
     def submit_password(self):
         if (
             self.entered_password == self.password or
-            self.entered_password == os.environ.get("PAIRING_PASSWORD")  # Use env var or default
+            self.entered_password == os.environ.get(
+                "PAIRING_PASSWORD", "letmein"
+            )
         ):
             self.is_authenticated = True
             self.error = ""
@@ -116,7 +166,6 @@ class TerminalPairState(rx.State):
         self.is_pairing = True
         self.error = ""
         try:
-            # Use the Square Devices API to create a device code for pairing
             idempotency_key = f"pair-{int(time.time())}"
             device_code_body = {
                 "name": "Reflex POS Terminal",
@@ -130,8 +179,11 @@ class TerminalPairState(rx.State):
             )
             if result.device_code and ("code" in result.device_code.__dict__):
                 self.pairing_code = result.device_code.code
-                # Now poll for the device_id after pairing
-                threading.Thread(target=self._poll_for_device_id, args=(result.device_code.code,), daemon=True).start()
+                threading.Thread(
+                    target=self._poll_for_device_id,
+                    args=(result.device_code.code,),
+                    daemon=True
+                ).start()
             else:
                 self.error = (
                     f"Pairing failed: {getattr(result, 'errors', 'Unknown error')}"
@@ -141,79 +193,58 @@ class TerminalPairState(rx.State):
         self.is_pairing = False
 
     def _poll_for_device_id(self, pairing_code):
-        """Poll the Devices API to get the device_id after pairing is complete."""
         devices_api = square_client.devices
         global shared_device_id
         for _ in range(30):  # Poll for up to 30 seconds
             try:
-                devices = devices_api.codes.list(location_id=SQUARE_LOCATION_ID)
-                # Find the device code with the matching pairing code and status PAIRED
+                devices = devices_api.codes.list(
+                    location_id=SQUARE_LOCATION_ID
+                )
                 for device_code in getattr(devices, "items", []):
                     if (
                         getattr(device_code, "code", "") == pairing_code and
                         getattr(device_code, "status", "") == "PAIRED"
                     ):
                         self.device_id = getattr(device_code, "device_id", "")
-                        shared_device_id = self.device_id  # <-- update shared variable
+                        shared_device_id = self.device_id
                         return
             except Exception:
                 pass
             time.sleep(1)
 
 
+# --- UI ---
 def index() -> rx.Component:
-    # Welcome Page (Index)
     return rx.container(
         rx.color_mode.button(position="top-right"),
         rx.vstack(
-            rx.heading("Select an amount to tip!", size="9"),
-            rx.grid(
-                rx.button(
-                    "$1",
-                    on_click=lambda: State.set_amount(100),
-                    size="3",
-                    height="80px",
-                    width="120px",
-                    font_size="2xl",
-                ),
-                rx.button(
-                    "$5",
-                    on_click=lambda: State.set_amount(500),
-                    size="3",
-                    height="80px",
-                    width="120px",
-                    font_size="2xl",
-                ),
-                rx.button(
-                    "$10",
-                    on_click=lambda: State.set_amount(1000),
-                    size="3",
-                    height="80px",
-                    width="120px",
-                    font_size="2xl",
-                ),
-                rx.input(
-                    placeholder="Custom $",
-                    value=State.custom_amount,
-                    on_change=State.set_custom_amount,
-                    width="120px",
-                    height="80px",
-                    font_size="2xl",
-                    padding="0 10px",
-                ),
-                rx.button(
-                    "Charge Custom",
-                    on_click=State.submit_custom_amount,
-                    size="3",
-                    height="80px",
-                    width="180px",
-                    font_size="2xl",
-                ),
-                columns="5",  # Responsive: 2 columns on small, 3 on medium+
-                gap="4",
-                justify_items="center",
-                align_items="center",
-                margin_y="2",
+            rx.heading("Enter Amount", size="9"),
+            rx.input(
+                placeholder="Enter amount $",
+                value=State.value_entry,
+                on_change=State.set_value_entry,
+                width="200px",
+                height="80px",
+                font_size="2xl",
+                padding="0 10px",
+            ),
+            rx.switch(
+                label="Auto Retry if not paid in 2 min",
+                checked=State.auto_retry,
+                on_change=State.set_auto_retry,
+                size="3",
+            ),
+            rx.button(
+                "Charge",
+                on_click=State.submit_value,
+                size="3",
+                height="80px",
+                width="180px",
+                font_size="2xl",
+            ),
+            rx.cond(
+                State.transaction_success,
+                rx.text("Payment successful!", color="green", font_size="xl"),
             ),
             spacing="5",
             justify="center",

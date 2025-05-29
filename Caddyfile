@@ -38,6 +38,10 @@
 		reverse_proxy 127.0.0.1:8000 # proxy all requests for /backend/* to the backend
 	}
 
+    handle_path /callback/* {
+        reverse_proxy 127.0.0.1:8081
+    }
+
 	# rewrite any errors to the corresponding error page
 	handle_errors {
 		rewrite * /{err.status_code}.html
