@@ -1,8 +1,6 @@
 import reflex as rx
 import os
 
-railway_domain = ""
-
 class ReflextemplateConfig(rx.Config):
     pass
 
@@ -13,5 +11,5 @@ config = ReflextemplateConfig(
     frontend_port=3000, # default frontend port
     backend_port=8000, # default backend port
     # use https and the railway public domain with a backend route if available, otherwise default to a local address
-    api_url=f'https://{os.environ[railway_domain]}/backend'
+    api_url='https://adampos.chancecallahan.com/backend'
 )
