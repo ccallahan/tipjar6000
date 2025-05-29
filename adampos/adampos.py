@@ -22,36 +22,7 @@ square_client = Square(
 
 shared_device_id = ""  # <-- Add this shared variable
 payment_timer = None  # <-- Add this global variable for the payment timer
-
-
-# --- Webhook/Callback Server ---
-class PaymentCallbackHandler(http.server.BaseHTTPRequestHandler):
-    def do_POST(self):
-        content_length = int(self.headers['Content-Length'])
-        post_data = self.rfile.read(content_length)
-        data = json.loads(post_data)
-        # You may want to add authentication/validation here
-        if data.get("type") == "payment.updated":
-            payment = data.get("data", {}).get("object", {}).get("payment", {})
-            status = payment.get("status")
-            idempotency_key = payment.get("reference_id")
-            if status == "COMPLETED":
-                State.on_payment_success(idempotency_key)
-        self.send_response(200)
-        self.end_headers()
-
-
-# Start the callback server in a background thread
-PORT = 8081
-
-
-def start_callback_server():
-    with socketserver.TCPServer(("", PORT), PaymentCallbackHandler) as httpd:
-        print(f"Callback server running on port {PORT}")
-        httpd.serve_forever()
-
-
-threading.Thread(target=start_callback_server, daemon=True).start()
+current_idempotency_key_global = ""
 
 
 # --- State ---
@@ -163,11 +134,12 @@ class State(rx.State):
             pass
 
     def trigger_transaction(self):
-        global shared_device_id, payment_timer
+        global shared_device_id, payment_timer, current_idempotency_key_global
         if not shared_device_id:
             print("Device ID is not set. Please pair the terminal first.")
             return
         idempotency_key = f"trans-{int(time.time())}"
+        current_idempotency_key_global = idempotency_key
         self.current_idempotency_key = idempotency_key
         body = {
             "idempotency_key": idempotency_key,
@@ -187,7 +159,6 @@ class State(rx.State):
         if hasattr(result, "checkout") and result.checkout:
             print("Checkout created:", result.checkout)
             self.transaction_success = False
-            # Start a timer for 2 minutes to check for payment completion
             if payment_timer:
                 payment_timer.cancel()
             payment_timer = threading.Timer(120, self.retry_transaction)
@@ -205,21 +176,46 @@ class State(rx.State):
                 "No payment confirmation after 2 minutes. "
                 "Cancelling and retrying..."
             )
-            # Cancel the previous transaction if possible
             self.trigger_transaction()
 
     @classmethod
     def on_payment_success(cls, idempotency_key):
         global payment_timer
-        # Called by the webhook handler
-        current_key = cls.current_idempotency_key
-        if hasattr(current_key, "get"):
-            current_key = current_key.get()
-        if current_key == idempotency_key:
-            cls.transaction_success = True
-            print(f"Payment {idempotency_key} completed!")
-            if payment_timer:
-                payment_timer.cancel()
+        cls.transaction_success = True
+        print(f"Payment {idempotency_key} completed!")
+        if payment_timer:
+            payment_timer.cancel()
+
+
+# --- Webhook/Callback Server ---
+class PaymentCallbackHandler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        content_length = int(self.headers['Content-Length'])
+        post_data = self.rfile.read(content_length)
+        data = json.loads(post_data)
+        # You may want to add authentication/validation here
+        if data.get("type") == "payment.updated":
+            payment = data.get("data", {}).get("object", {}).get("payment", {})
+            status = payment.get("status")
+            idempotency_key = payment.get("reference_id")
+            if status == "COMPLETED":
+                if idempotency_key == current_idempotency_key_global:
+                    State.on_payment_success(idempotency_key)
+        self.send_response(200)
+        self.end_headers()
+
+
+# Start the callback server in a background thread
+PORT = 8081
+
+
+def start_callback_server():
+    with socketserver.TCPServer(("", PORT), PaymentCallbackHandler) as httpd:
+        print(f"Callback server running on port {PORT}")
+        httpd.serve_forever()
+
+
+threading.Thread(target=start_callback_server, daemon=True).start()
 
 
 # --- UI ---
