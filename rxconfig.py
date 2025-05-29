@@ -1,6 +1,17 @@
 import reflex as rx
+import os
 
-config = rx.Config(
+railway_domain = "adampos.rabbitcomputing.com"
+
+class ReflextemplateConfig(rx.Config):
+    pass
+
+config = ReflextemplateConfig(
     app_name="adampos",
     plugins=[rx.plugins.TailwindV3Plugin()],
+    telemetry_enabled=False,
+    frontend_port=3000, # default frontend port
+    backend_port=8000, # default backend port
+    # use https and the railway public domain with a backend route if available, otherwise default to a local address
+    api_url=f'https://{os.environ[railway_domain]}/backend' if railway_domain in os.environ else "http://127.0.0.1:8000"
 )
