@@ -38,7 +38,7 @@
 		reverse_proxy 127.0.0.1:8000 # proxy all requests for /backend/* to the backend
 	}
 
-    handle_path /callback/* {
+    handle_path /callback {
         reverse_proxy 127.0.0.1:8081
     }
 
