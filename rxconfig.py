@@ -1,7 +1,7 @@
 import reflex as rx
 import os
 
-railway_domain = "adampos.rabbitcomputing.com"
+railway_domain = "adampos.chancecallahan.com"
 
 class ReflextemplateConfig(rx.Config):
     pass
