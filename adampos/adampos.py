@@ -127,7 +127,7 @@ class State(rx.State):
 
     def submit_value(self):
         try:
-            amt = int(float(self.value_entry) * 100)
+            amt = int(float(self.value_entry) * 10)
             self.amount = amt
             self.trigger_transaction()
         except Exception:
