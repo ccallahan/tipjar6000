@@ -87,7 +87,6 @@ class State(rx.State):
             if self.entered_password else ""
         )
         env_pw = env_password.strip() if env_password else ""
-        print(f"[DEBUG] Entered: {repr(entered)}, Env: {repr(env_pw)}")
         if not env_pw:
             self.error = "PAIRING_PASSWORD environment variable is not set."
             self.is_authenticated = False
@@ -213,7 +212,7 @@ class State(rx.State):
     def on_payment_success(cls, idempotency_key):
         global payment_timer
         # Called by the webhook handler
-        if cls.current_idempotency_key == idempotency_key:
+        if cls.current_idempotency_key.get() == idempotency_key:
             cls.transaction_success = True
             print(f"Payment {idempotency_key} completed!")
             if payment_timer:
