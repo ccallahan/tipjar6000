@@ -1,7 +1,6 @@
 """Welcome to Reflex! This file outlines the steps to create a basic app."""
 
 import reflex as rx
-from rxconfig import config
 from square.client import Square
 from square.environment import SquareEnvironment as square_env
 import threading
@@ -22,6 +21,7 @@ square_client = Square(
 )
 
 shared_device_id = ""  # <-- Add this shared variable
+payment_timer = None  # <-- Add this global variable for the payment timer
 
 
 # --- Webhook/Callback Server ---
@@ -61,7 +61,14 @@ class State(rx.State):
     auto_retry: bool = False
     transaction_success: bool = False
     current_idempotency_key: str = ""
-    payment_timer: threading.Timer = None
+    # Pairing state
+    entered_password: str = ""
+    pairing_code: str = ""
+    device_id: str = ""
+    error: str = ""
+    is_authenticated: bool = False
+    is_pairing: bool = False
+    # Removed payment_timer from state
 
     def set_value_entry(self, value: str):
         self.value_entry = value
@@ -69,95 +76,31 @@ class State(rx.State):
     def set_auto_retry(self, value: bool):
         self.auto_retry = value
 
-    def submit_value(self):
-        try:
-            amt = int(float(self.value_entry) * 100)
-            self.amount = amt
-            self.trigger_transaction()
-        except Exception:
-            pass
-
-    def trigger_transaction(self):
-        global shared_device_id
-        if not shared_device_id:
-            print("Device ID is not set. Please pair the terminal first.")
-            return
-        idempotency_key = f"trans-{int(time.time())}"
-        self.current_idempotency_key = idempotency_key
-        body = {
-            "idempotency_key": idempotency_key,
-            "checkout": {
-                "amount_money": {
-                    "amount": self.amount,
-                    "currency": "USD",
-                },
-                "device_options": {
-                    "device_id": shared_device_id,
-                },
-                "note": "POS Payment",
-                "reference_id": idempotency_key,
-            }
-        }
-        result = square_client.terminal.checkouts.create(**body)
-        if hasattr(result, "checkout") and result.checkout:
-            print("Checkout created:", result.checkout)
-            self.transaction_success = False
-            # Start a timer for 2 minutes to check for payment completion
-            if self.payment_timer:
-                self.payment_timer.cancel()
-            self.payment_timer = threading.Timer(120, self.retry_transaction)
-            self.payment_timer.start()
-        else:
-            print(
-                "Terminal checkout failed:",
-                getattr(result, "errors", "Unknown error")
-            )
-
-    def retry_transaction(self):
-        if not self.transaction_success and self.auto_retry:
-            print(
-                "No payment confirmation after 2 minutes. "
-                "Cancelling and retrying..."
-            )
-            # Cancel the previous transaction if possible
-            self.trigger_transaction()
-
-    @classmethod
-    def on_payment_success(cls, idempotency_key):
-        # Called by the webhook handler
-        if cls.current_idempotency_key == idempotency_key:
-            cls.transaction_success = True
-            print(f"Payment {idempotency_key} completed!")
-            if cls.payment_timer:
-                cls.payment_timer.cancel()
-
-
-# --- Terminal Pairing State ---
-class TerminalPairState(rx.State):
-    password: str = ""
-    entered_password: str = ""
-    pairing_code: str = ""
-    device_id: str = ""
-    error: str = ""
-    is_authenticated: bool = False
-    is_pairing: bool = False
-
     def set_entered_password(self, value: str):
         self.entered_password = value
         self.error = ""
 
     def submit_password(self):
-        if (
-            self.entered_password == self.password or
-            self.entered_password == os.environ.get(
-                "PAIRING_PASSWORD", "letmein"
-            )
-        ):
+        env_password = os.environ.get("PAIRING_PASSWORD")
+        entered = (
+            self.entered_password.strip()
+            if self.entered_password else ""
+        )
+        env_pw = env_password.strip() if env_password else ""
+        print(f"[DEBUG] Entered: {repr(entered)}, Env: {repr(env_pw)}")
+        if not env_pw:
+            self.error = "PAIRING_PASSWORD environment variable is not set."
+            self.is_authenticated = False
+            self.entered_password = ""
+            return
+        if entered == env_pw:
             self.is_authenticated = True
             self.error = ""
+            self.entered_password = ""
         else:
             self.error = "Incorrect password."
             self.is_authenticated = False
+            self.entered_password = ""
 
     def pair_terminal(self):
         if not self.is_authenticated:
@@ -212,6 +155,70 @@ class TerminalPairState(rx.State):
                 pass
             time.sleep(1)
 
+    def submit_value(self):
+        try:
+            amt = int(float(self.value_entry) * 100)
+            self.amount = amt
+            self.trigger_transaction()
+        except Exception:
+            pass
+
+    def trigger_transaction(self):
+        global shared_device_id, payment_timer
+        if not shared_device_id:
+            print("Device ID is not set. Please pair the terminal first.")
+            return
+        idempotency_key = f"trans-{int(time.time())}"
+        self.current_idempotency_key = idempotency_key
+        body = {
+            "idempotency_key": idempotency_key,
+            "checkout": {
+                "amount_money": {
+                    "amount": self.amount,
+                    "currency": "USD",
+                },
+                "device_options": {
+                    "device_id": shared_device_id,
+                },
+                "note": "POS Payment",
+                "reference_id": idempotency_key,
+            }
+        }
+        result = square_client.terminal.checkouts.create(**body)
+        if hasattr(result, "checkout") and result.checkout:
+            print("Checkout created:", result.checkout)
+            self.transaction_success = False
+            # Start a timer for 2 minutes to check for payment completion
+            if payment_timer:
+                payment_timer.cancel()
+            payment_timer = threading.Timer(120, self.retry_transaction)
+            payment_timer.start()
+        else:
+            print(
+                "Terminal checkout failed:",
+                getattr(result, "errors", "Unknown error")
+            )
+
+    def retry_transaction(self):
+        global payment_timer
+        if not self.transaction_success and self.auto_retry:
+            print(
+                "No payment confirmation after 2 minutes. "
+                "Cancelling and retrying..."
+            )
+            # Cancel the previous transaction if possible
+            self.trigger_transaction()
+
+    @classmethod
+    def on_payment_success(cls, idempotency_key):
+        global payment_timer
+        # Called by the webhook handler
+        if cls.current_idempotency_key == idempotency_key:
+            cls.transaction_success = True
+            print(f"Payment {idempotency_key} completed!")
+            if payment_timer:
+                payment_timer.cancel()
+
 
 # --- UI ---
 def index() -> rx.Component:
@@ -253,6 +260,90 @@ def index() -> rx.Component:
     )
 
 
+class TerminalPairState(rx.State):
+    entered_password: str = ""
+    pairing_code: str = ""
+    device_id: str = ""
+    error: str = ""
+    is_authenticated: bool = False
+    is_pairing: bool = False
+
+    def set_entered_password(self, value: str):
+        self.entered_password = value
+        self.error = ""
+
+    def submit_password(self):
+        env_password = os.environ.get("PAIRING_PASSWORD")
+        entered = (
+            self.entered_password.strip()
+            if self.entered_password else ""
+        )
+        env_pw = env_password.strip() if env_password else ""
+        print(f"[DEBUG] Entered: {repr(entered)}, Env: {repr(env_pw)}")
+        if not env_pw:
+            self.error = "PAIRING_PASSWORD environment variable is not set."
+            self.is_authenticated = False
+            return
+        if entered == env_pw:
+            self.is_authenticated = True
+            self.error = ""
+        else:
+            self.error = "Incorrect password."
+            self.is_authenticated = False
+
+    def pair_terminal(self):
+        if not self.is_authenticated:
+            self.error = "You must enter the correct password."
+            return
+        self.is_pairing = True
+        self.error = ""
+        try:
+            idempotency_key = f"pair-{int(time.time())}"
+            device_code_body = {
+                "name": "Reflex POS Terminal",
+                "product_type": "TERMINAL_API",
+                "location_id": SQUARE_LOCATION_ID,
+            }
+            codes_api = square_client.devices.codes
+            result = codes_api.create(
+                idempotency_key=idempotency_key,
+                device_code=device_code_body
+            )
+            if result.device_code and ("code" in result.device_code.__dict__):
+                self.pairing_code = result.device_code.code
+                threading.Thread(
+                    target=self._poll_for_device_id,
+                    args=(result.device_code.code,),
+                    daemon=True
+                ).start()
+            else:
+                self.error = (
+                    f"Pairing failed: {getattr(result, 'errors', 'Unknown error')}"
+                )
+        except Exception as e:
+            self.error = f"Pairing failed: {e}"
+        self.is_pairing = False
+
+    def _poll_for_device_id(self, pairing_code):
+        devices_api = square_client.devices
+        global shared_device_id
+        for _ in range(30):  # Poll for up to 30 seconds
+            try:
+                devices = devices_api.codes.list(location_id=SQUARE_LOCATION_ID)
+                for device_code in getattr(devices, "items", []):
+                    if (
+                        getattr(device_code, "code", "") == pairing_code and
+                        getattr(device_code, "status", "") == "PAIRED"
+                    ):
+                        self.device_id = getattr(device_code, "device_id", "")
+                        shared_device_id = self.device_id
+                        return
+            except Exception:
+                pass
+            time.sleep(1)
+
+
+# --- UI ---
 def terminal_pairing_page() -> rx.Component:
     return rx.container(
         rx.heading("Pair Square Terminal", size="7", margin_y="4"),
@@ -298,6 +389,7 @@ def terminal_pairing_page() -> rx.Component:
                     width="220px",
                     height="50px",
                     font_size="xl",
+                    autoComplete="new-password",
                 ),
                 rx.button(
                     "Unlock",
@@ -322,4 +414,7 @@ def terminal_pairing_page() -> rx.Component:
 
 app = rx.App()
 app.add_page(index, route="/")
-app.add_page(terminal_pairing_page, route="/pair-terminal")
+app.add_page(
+    terminal_pairing_page,
+    route="/pair-terminal"
+)
