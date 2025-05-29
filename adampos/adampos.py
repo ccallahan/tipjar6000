@@ -185,6 +185,11 @@ class State(rx.State):
         print(f"Payment {idempotency_key} completed!")
         if payment_timer:
             payment_timer.cancel()
+        # Auto-retry: start a new transaction if enabled
+        if cls.auto_retry:
+            print("Auto-retry is enabled. Starting a new transaction.")
+            cls.transaction_success = False
+            cls.submit_value()
 
 
 # --- Webhook/Callback Server ---
